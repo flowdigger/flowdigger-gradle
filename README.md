@@ -7,6 +7,9 @@ Owns Gradle build and publishing semantics.
 - **ID:** `org.flowdigger.maven-publish`
 - **Type:** precompiled Kotlin script convention plugin
 - **Location:** `src/main/kotlin/org.flowdigger.maven-publish.gradle.kts`
+- **ID:** `org.flowdigger.dependency-check`
+- **Type:** precompiled Kotlin script convention plugin
+- **Location:** `src/main/kotlin/org.flowdigger.dependency-check.gradle.kts`
 
 ## Consumer usage
 
@@ -33,6 +36,8 @@ pluginManagement {
 ```kotlin
 plugins {
     id("org.flowdigger.maven-publish")
+    id("org.owasp.dependencycheck") version "13.0.0"
+    id("org.flowdigger.dependency-check")
 }
 ```
 
