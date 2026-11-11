@@ -1,10 +1,17 @@
 import org.gradle.api.GradleException
+import org.gradle.api.file.DuplicatesStrategy
 import org.gradle.api.plugins.JavaPluginExtension
 import org.gradle.api.provider.Provider
 import org.gradle.api.provider.ProviderFactory
 import org.gradle.api.publish.PublishingExtension
 import org.gradle.api.publish.maven.MavenPublication
+import org.gradle.api.publish.maven.tasks.GenerateMavenPom
+import org.gradle.api.tasks.Sync
+import org.gradle.api.tasks.bundling.Zip
 import org.gradle.plugins.signing.SigningExtension
+import org.w3c.dom.Element
+import java.security.MessageDigest
+import javax.xml.parsers.DocumentBuilderFactory
 
 plugins {
     `maven-publish`
@@ -31,9 +38,13 @@ if (publishTarget.get() !in supportedTargets) {
 }
 
 val centralUsername = providers.secret("flowdigger.publish.username", "MAVEN_CENTRAL_USERNAME")
+    .orElse(providers.gradleProperty("mavenCentralUsername"))
 val centralPassword = providers.secret("flowdigger.publish.password", "MAVEN_CENTRAL_PASSWORD")
+    .orElse(providers.gradleProperty("mavenCentralPassword"))
 val signingKey = providers.secret("flowdigger.signing.key", "SIGNING_KEY")
+    .orElse(providers.gradleProperty("signingKey"))
 val signingPassword = providers.secret("flowdigger.signing.password", "SIGNING_PASSWORD")
+    .orElse(providers.gradleProperty("signingPassword"))
 
 pluginManager.withPlugin("java") {
     extensions.configure<JavaPluginExtension> {
@@ -126,6 +137,7 @@ extensions.configure<SigningExtension> {
 val validateCentralPublication = tasks.register("validateCentralPublication") {
     group = "verification"
     description = "Validates required metadata, credentials, and signing inputs for central publication."
+    dependsOn(tasks.withType(GenerateMavenPom::class.java))
 
     doLast {
         if (publishTarget.get() != "central") {
@@ -158,21 +170,50 @@ val validateCentralPublication = tasks.register("validateCentralPublication") {
 
         mavenPublications.forEach { publication ->
             required("Publication name", publication.name)
-            required("POM name", publication.pom.name.orNull)
-            required("POM description", publication.pom.description.orNull)
-            required("Project URL", publication.pom.url.orNull)
+            val publicationName = publication.name.replaceFirstChar { it.uppercaseChar() }
+            val generatePomTask = tasks.named(
+                "generatePomFileFor${publicationName}Publication",
+                GenerateMavenPom::class.java
+            ).get()
+            val pomFile = generatePomTask.destination
+            if (!pomFile.exists()) {
+                throw GradleException("Generated POM not found for publication '${publication.name}': $pomFile")
+            }
+            val document = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(pomFile)
+            val projectElement = document.documentElement
+            fun text(element: Element, tagName: String): String? =
+                element.getElementsByTagName(tagName).item(0)?.textContent?.trim()
+
+            required("POM name", text(projectElement, "name"))
+            required("POM description", text(projectElement, "description"))
+            required("Project URL", text(projectElement, "url"))
+
+            val licenses = projectElement.getElementsByTagName("license")
+            if (licenses.length == 0) {
+                throw GradleException("At least one <license> entry is required in publication '${publication.name}'.")
+            }
+            val firstLicense = licenses.item(0) as Element
+            required("License name", text(firstLicense, "name"))
+            required("License URL", text(firstLicense, "url"))
+
+            val scmEntries = projectElement.getElementsByTagName("scm")
+            if (scmEntries.length == 0) {
+                throw GradleException("A <scm> entry is required in publication '${publication.name}'.")
+            }
+            val scmElement = scmEntries.item(0) as Element
+            required("SCM URL", text(scmElement, "url"))
+            required("SCM connection", text(scmElement, "connection"))
+            required("SCM developer connection", text(scmElement, "developerConnection"))
+
+            val developers = projectElement.getElementsByTagName("developer")
+            if (developers.length == 0) {
+                throw GradleException("At least one <developer> entry is required in publication '${publication.name}'.")
+            }
+            val firstDeveloper = developers.item(0) as Element
+            required("Developer ID", text(firstDeveloper, "id"))
+            required("Developer name", text(firstDeveloper, "name"))
         }
 
-        required("License name", "Apache License, Version 2.0")
-        required("License URL", "https://www.apache.org/licenses/LICENSE-2.0.txt")
-        required("SCM URL", providers.gradleProperty("scmUrl").orNull)
-        required("SCM connection", providers.gradleProperty("scmConnection").orNull)
-        required(
-            "SCM developer connection",
-            providers.gradleProperty("scmDeveloperConnection").orNull
-        )
-        required("Developer ID", providers.gradleProperty("developerId").orNull)
-        required("Developer name", providers.gradleProperty("developerName").orNull)
         required("Maven Central username", centralUsername.orNull)
         required("Maven Central password", centralPassword.orNull)
         required("Signing key", signingKey.orNull)
@@ -184,4 +225,77 @@ tasks.matching { task ->
     task.name.startsWith("publish") && task.name.contains("ToCentralRepository")
 }.configureEach {
     dependsOn(validateCentralPublication)
+}
+
+val centralStagingRoot = layout.buildDirectory.dir("central-staging-repo")
+
+val stageCentralBundleRepo = tasks.register("stageCentralBundleRepo", Sync::class.java) {
+    dependsOn(tasks.named("publishToMavenLocal"))
+    into(centralStagingRoot)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    notCompatibleWithConfigurationCache("Stages local Maven publications by traversing publication metadata at execution time.")
+    val publicationPaths = linkedSetOf<String>()
+
+    publishingExtension.publications.withType(MavenPublication::class.java).configureEach {
+        val publicationPath = "${groupId.replace('.', '/')}/$artifactId/$version"
+        if (publicationPaths.add(publicationPath)) {
+            from(file("${System.getProperty("user.home")}/.m2/repository/$publicationPath")) {
+                into(publicationPath)
+            }
+        }
+    }
+
+    doFirst {
+        publicationPaths.forEach { publicationPath ->
+            val localPublicationDir = file("${System.getProperty("user.home")}/.m2/repository/$publicationPath")
+            if (!localPublicationDir.exists()) {
+                throw GradleException("Expected local Maven publication directory not found: $localPublicationDir")
+            }
+        }
+    }
+}
+
+val generateCentralBundleChecksums = tasks.register("generateCentralBundleChecksums") {
+    dependsOn(stageCentralBundleRepo)
+    notCompatibleWithConfigurationCache("Generates checksum files by scanning staged output directory at execution time.")
+
+    doLast {
+        val stagedRepoDir = centralStagingRoot.get().asFile
+        if (!stagedRepoDir.exists()) {
+            throw GradleException("Expected staged repository directory not found: $stagedRepoDir")
+        }
+
+        fun checksum(input: java.io.File, algorithm: String): String {
+            val digest = MessageDigest.getInstance(algorithm)
+            input.inputStream().use { stream ->
+                val buffer = ByteArray(8192)
+                while (true) {
+                    val read = stream.read(buffer)
+                    if (read < 0) {
+                        break
+                    }
+                    digest.update(buffer, 0, read)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        }
+
+        stagedRepoDir.walkTopDown().forEach { candidate ->
+            if (candidate.isFile && !candidate.name.endsWith(".md5") && !candidate.name.endsWith(".sha1")) {
+                java.io.File(candidate.parentFile, "${candidate.name}.md5")
+                    .writeText("${checksum(candidate, "MD5")}\n")
+                java.io.File(candidate.parentFile, "${candidate.name}.sha1")
+                    .writeText("${checksum(candidate, "SHA-1")}\n")
+            }
+        }
+    }
+}
+
+tasks.register("packageCentralBundle", Zip::class.java) {
+    dependsOn(generateCentralBundleChecksums)
+    archiveBaseName.set(project.name)
+    archiveVersion.set(project.version.toString())
+    archiveClassifier.set("central-bundle")
+    destinationDirectory.set(layout.buildDirectory.dir("central-bundle"))
+    from(layout.buildDirectory.dir("central-staging-repo"))
 }
